@@ -260,4 +260,132 @@ public struct CoreOCRService {
             return .failure(.visionRequestFailed(error))
         }
     }
+}
+
+// C ABIと互換性のあるエラーコード
+@objc public enum CErrorCode: Int32 {
+    case success = 0
+    case errorFileNotFound = 1
+    case errorImageLoadFailed = 2
+    case errorPdfLoadFailed = 3
+    case errorVisionRequestFailed = 4
+    case errorInvalidParameter = 5 // パラメータ不正を追加
+    case errorOther = 6          // 他のエラーコードを調整
+}
+
+// C ABIと互換性のある認識レベル
+@objc public enum CRecognitionLevel: Int32 {
+    case accurate = 0
+    case fast = 1
+}
+
+// SwiftのStringを解放するための関数
+@_cdecl("free_swift_string")
+public func free_swift_string(ptr: UnsafeMutablePointer<CChar>?) {
+    // freeを使用（strdupで確保したメモリを解放するため）
+    free(ptr)
+}
+
+// メインのCインターフェース関数 (パラメータ追加)
+@_cdecl("recognize_text_c")
+public func recognize_text_c(
+    filePath: UnsafePointer<CChar>,
+    languages: UnsafePointer<UnsafePointer<CChar>?>?, // 言語文字列ポインタの配列 (NULL許容)
+    languageCount: Int32,                           // 言語配列の要素数
+    level: Int32,                                   // CRecognitionLevel の rawValue
+    preserveOrder: Int32,                           // 0: false, 1: true
+    outputResult: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>, // 結果文字列へのポインタのポインタ
+    outputError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>   // エラー文字列へのポインタのポインタ
+) -> CErrorCode {
+    outputResult.pointee = nil // Initialize output pointers
+    outputError.pointee = nil
+
+    // --- パラメータ変換 ---
+    let path = String(cString: filePath)
+
+    // 言語リストの変換 (nil または 有効な配列)
+    var swiftLanguages: [String]? = nil
+    if let langPtr = languages, languageCount > 0 {
+        swiftLanguages = []
+        for i in 0..<Int(languageCount) {
+            if let langCStringPtr = langPtr[i] {
+                swiftLanguages?.append(String(cString: langCStringPtr))
+            } else {
+                 // 配列内にNULLポインタがあった場合のエラー処理 (例)
+                let errorMsg = "Invalid language array: contains NULL pointer."
+                outputError.pointee = strdup(errorMsg)
+                return .errorInvalidParameter
+            }
+        }
+    } else if languages != nil && languageCount <= 0 {
+         // ポインタは非NULLだが要素数が0以下の場合もエラーとする (任意)
+        let errorMsg = "Invalid language parameter: non-nil array with count <= 0."
+        outputError.pointee = strdup(errorMsg)
+        return .errorInvalidParameter
+    }
+    // languages が NULL かつ languageCount が 0 の場合は swiftLanguages = nil のまま (自動検出)
+
+    // 認識レベルの変換
+    guard let swiftRecognitionLevel = VNRequestTextRecognitionLevel(cRecognitionLevel: CRecognitionLevel(rawValue: level)) else {
+        let errorMsg = "Invalid recognition level value: \\(level)"
+        outputError.pointee = strdup(errorMsg)
+        return .errorInvalidParameter
+    }
+
+    // ページ順序維持フラグの変換
+    let swiftPreserveOrder = (preserveOrder != 0) // 0以外ならtrue
+
+    // --- CoreOCRServiceの呼び出し ---
+    let service = CoreOCRService()
+    let result = service.recognizeText(
+        from: path,
+        recognitionLanguages: swiftLanguages,
+        recognitionLevel: swiftRecognitionLevel,
+        preservePageOrder: swiftPreserveOrder
+        // progressHandler はCインターフェースでは未対応 (必要なら拡張が必要)
+    )
+
+    // --- 結果/エラーのC文字列への変換 ---
+    switch result {
+    case .success(let recognizedText):
+        guard let cStringResult = strdup(recognizedText) else {
+            let errorMsg = "Memory allocation failed for result string."
+            outputError.pointee = strdup(errorMsg)
+            return .errorOther
+        }
+        outputResult.pointee = cStringResult
+        return .success
+    case .failure(let error):
+        let errorMessage = error.localizedDescription
+        guard let cStringError = strdup(errorMessage) else {
+            return .errorOther // メモリ確保失敗
+        }
+        outputError.pointee = cStringError
+
+        if let ocrError = error as? OCRError {
+            switch ocrError {
+            case .fileNotFound: return .errorFileNotFound
+            case .imageLoadFailed: return .errorImageLoadFailed
+            case .pdfLoadFailed: return .errorPdfLoadFailed
+            case .visionRequestFailed: return .errorVisionRequestFailed
+            // imageConversionFailed, unexpectedResultType, pdfPageImageConversionFailed も .errorOther にマッピング
+            default: return .errorOther
+            }
+        } else {
+            return .errorOther
+        }
+    }
+}
+
+// VNRequestTextRecognitionLevel と CRecognitionLevel を相互変換するためのヘルパー
+// (VNRequestTextRecognitionLevel の extension として定義すると便利)
+extension VNRequestTextRecognitionLevel {
+    init?(cRecognitionLevel: CRecognitionLevel?) {
+        guard let level = cRecognitionLevel else { return nil }
+        switch level {
+        case .accurate: self = .accurate
+        case .fast: self = .fast
+        // default は不要、enumが網羅的なため
+        }
+    }
 } 

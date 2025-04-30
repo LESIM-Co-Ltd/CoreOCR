@@ -12,6 +12,7 @@ let package = Package(
         // Library product exposing the CoreOCRLib module
         .library(
             name: "CoreOCRLib",
+            type: .dynamic,
             targets: ["CoreOCRLib"]),
         // Executable product providing the command-line tool
         .executable(
