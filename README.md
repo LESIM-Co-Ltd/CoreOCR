@@ -18,6 +18,17 @@ A simple command-line tool and Swift library for performing Optical Character Re
 *   macOS 10.15 or later
 *   Xcode command-line tools (or Xcode) including Swift 6 or later
 
+## Installation (using Homebrew)
+
+You can install the `CoreOCRCLI` tool using Homebrew:
+
+```bash
+brew tap LESIM-Co-Ltd/coreocr
+brew install coreocr
+```
+
+This will install the command-line tool as `coreocr`.
+
 ## Building
 
 1.  Clone the repository:
