@@ -29,48 +29,35 @@ brew install coreocr
 
 This will install the command-line tool as `coreocr`.
 
-## Building
-
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/your-username/CoreOCR.git # Replace with your repo URL
-    cd CoreOCR
-    ```
-2.  Build the project (this will build both the library and the CLI tool):
-    ```bash
-    swift build -c release
-    ```
-    The executable will be located at `.build/release/CoreOCRCLI`.
-
 ## CLI Usage
 
-The command-line tool `CoreOCRCLI` takes a file path as input and prints the recognized text to standard output. By default, text from PDF pages is output in the original page order. Progress for PDF files and any errors are printed to standard error.
+The command-line tool `coreocr` takes a file path as input and prints the recognized text to standard output. By default, text from PDF pages is output in the original page order. Progress for PDF files and any errors are printed to standard error.
 
 **Basic Usage (Page order preserved):**
 
 ```bash
 # For an image file
-.build/release/CoreOCRCLI /path/to/your/image.png
+coreocr /path/to/your/image.png
 
 # For a PDF file (progress will be shown on stderr)
-.build/release/CoreOCRCLI /path/to/your/document.pdf
+coreocr /path/to/your/document.pdf
 ```
 
 **Options:**
 
 *   `-l, --languages <langs>`: Specify comma-separated languages for recognition (e.g., `en-US,ja-JP`). Defaults to automatic detection.
     ```bash
-    .build/release/CoreOCRCLI -l en-US,es-ES /path/to/file.pdf
+    coreocr -l en-US,es-ES /path/to/file.pdf
     ```
 *   `--level <level>`: Set the recognition level (`accurate` or `fast`). Defaults to `accurate`.
     ```bash
-    .build/release/CoreOCRCLI --level fast /path/to/image.jpg
+    coreocr --level fast /path/to/image.jpg
     ```
 *   `-p, --parallel`: Process PDF pages in parallel. This might be faster but does **not** guarantee the original page order in the output.
     ```bash
-    .build/release/CoreOCRCLI --parallel /path/to/your/document.pdf
+    coreocr --parallel /path/to/your/document.pdf
     # Or using the short option:
-    .build/release/CoreOCRCLI -p /path/to/your/document.pdf
+    coreocr -p /path/to/your/document.pdf
     ```
 
 ## Library Usage (`CoreOCRLib`)
@@ -141,6 +128,21 @@ You can use the `CoreOCRLib` module in your own Swift projects.
     }
     ```
 
+## Building (Manual)
+
+If you prefer to build from source:
+
+1.  Clone the repository:
+    ```bash
+    git clone https://github.com/LESIM-Co-Ltd/CoreOCR.git # Replace with your repo URL
+    cd CoreOCR
+    ```
+2.  Build the project (this will build both the library and the CLI tool):
+    ```bash
+    swift build -c release
+    ```
+    The executable will be located at `.build/release/CoreOCRCLI`. 
+
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details (you should add a LICENSE file containing the MIT license text). 
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details (you should add a LICENSE file containing the MIT license text).
