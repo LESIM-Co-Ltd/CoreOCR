@@ -1,8 +1,9 @@
 import Vision
-import AppKit // For NSImage, PDFKit
-@preconcurrency import PDFKit // For PDF processing (suppress Sendable warnings)
+import AppKit // Required for NSImage, used for image loading
+@preconcurrency import PDFKit // Required for PDFDocument, suppress Sendable warnings for now
 import Foundation
 
+/// Errors that can occur during OCR processing.
 public enum OCRError: Error, LocalizedError {
     case fileNotFound(path: String)
     case imageLoadFailed(path: String)
@@ -21,33 +22,37 @@ public enum OCRError: Error, LocalizedError {
         case .pdfLoadFailed(let path):
             return "Failed to load PDF file: \(path)"
         case .imageConversionFailed:
-            return "Failed to convert image format."
+            return "Failed to convert image format for Vision processing."
         case .visionRequestFailed(let underlyingError):
-            return "Vision request failed: \(underlyingError.localizedDescription)"
+            return "Vision text recognition request failed: \(underlyingError.localizedDescription)"
         case .unexpectedResultType:
-            return "Received unexpected result type."
+            return "Vision request returned an unexpected result type."
         case .pdfPageImageConversionFailed(let page):
-             return "Failed to convert PDF page to image (Page: \(page + 1))."
+            return "Failed to convert PDF page to image (Page: \(page + 1))."
         }
     }
 }
 
-// Type alias for the progress handler callback
+/// Callback type for reporting progress, typically used for PDF processing.
+/// Parameters are: (current page number, total number of pages).
 public typealias ProgressHandler = (_ currentPage: Int, _ totalPages: Int) -> Void
 
-// Consider Sendable conformance (not done this time, but may be needed in the future)
+/// Service class providing OCR functionality using Apple's Vision framework.
 public struct CoreOCRService {
 
-    // Public initializer
     public init() {}
 
-    /// Recognizes text from the specified file path (image or PDF).
+    /// Recognizes text from the specified image or PDF file path.
+    ///
     /// - Parameter filePath: Path to the image or PDF file.
-    /// - Parameter recognitionLanguages: List of languages to recognize (e.g., ["en-US", "ja-JP"]). nil for auto-detection.
-    /// - Parameter recognitionLevel: Recognition level (`.accurate` or `.fast`).
-    /// - Parameter preservePageOrder: If true (default), processes PDF pages sequentially to preserve order. If false, uses parallel processing (faster, order not guaranteed).
-    /// - Parameter progressHandler: Optional callback to report progress during PDF processing.
-    /// - Returns: A Result containing the recognized text (String) on success, or an OCRError on failure.
+    /// - Parameter recognitionLanguages: An array of language codes (e.g., `["en-US", "ja-JP"]`) to prioritize.
+    ///                                   If `nil` or empty, Vision attempts automatic language detection.
+    /// - Parameter recognitionLevel: The recognition level, `.accurate` or `.fast`. Defaults to `.accurate`.
+    ///                               Note: `.fast` might be less stable for some PDFs.
+    /// - Parameter preservePageOrder: If `true` (default), processes PDF pages sequentially to ensure the output text order matches the page order.
+    ///                                If `false`, pages may be processed in parallel for potential speedup, but text order is not guaranteed.
+    /// - Parameter progressHandler: An optional closure to receive progress updates during PDF processing.
+    /// - Returns: A `Result` containing the recognized text as a single `String` on success, or an `OCRError` on failure.
     public func recognizeText(from filePath: String, recognitionLanguages: [String]? = nil, recognitionLevel: VNRequestTextRecognitionLevel = .accurate, preservePageOrder: Bool = true, progressHandler: ProgressHandler? = nil) -> Result<String, OCRError> {
         let fileURL = URL(fileURLWithPath: filePath)
 
@@ -55,122 +60,135 @@ public struct CoreOCRService {
             return .failure(.fileNotFound(path: filePath))
         }
 
-        // Determine if it's an image or PDF based on the file extension
+        // Determine file type and delegate to appropriate method.
         if fileURL.pathExtension.lowercased() == "pdf" {
-            // Pass the progressHandler
             return recognizeTextFromPDF(pdfURL: fileURL, recognitionLanguages: recognitionLanguages, recognitionLevel: recognitionLevel, preservePageOrder: preservePageOrder, progressHandler: progressHandler)
         } else {
-            // Try processing as an image
             guard let nsImage = NSImage(contentsOf: fileURL) else {
-                 // If not PDF, treat as image load failure
                 return .failure(.imageLoadFailed(path: filePath))
             }
-            // Progress for single image (optional call)
+            // Report progress for single image (1 out of 1 page).
             progressHandler?(1, 1)
             return recognizeTextFromImage(nsImage: nsImage, recognitionLanguages: recognitionLanguages, recognitionLevel: recognitionLevel)
         }
     }
 
-    /// Recognizes text from an NSImage.
+    /// Recognizes text from an `NSImage` instance.
     private func recognizeTextFromImage(nsImage: NSImage, recognitionLanguages: [String]?, recognitionLevel: VNRequestTextRecognitionLevel) -> Result<String, OCRError> {
+        // Attempt to get a CGImage representation suitable for Vision.
         guard let cgImage = nsImage.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
             return .failure(.imageConversionFailed)
         }
-        // Call static method
         return Self.performVisionRequest(cgImage: cgImage, recognitionLanguages: recognitionLanguages, recognitionLevel: recognitionLevel)
     }
 
-    /// Recognizes text from a PDF file URL, optionally preserving page order.
+    /// Recognizes text from a PDF file, handling page processing sequentially or in parallel.
     private func recognizeTextFromPDF(pdfURL: URL, recognitionLanguages: [String]?, recognitionLevel: VNRequestTextRecognitionLevel, preservePageOrder: Bool, progressHandler: ProgressHandler?) -> Result<String, OCRError> {
         guard let pdfDocument = PDFDocument(url: pdfURL) else {
             return .failure(.pdfLoadFailed(path: pdfURL.path))
         }
         let totalPages = pdfDocument.pageCount
+        guard totalPages > 0 else {
+            return .success("") // Return empty string for an empty PDF.
+        }
 
         if preservePageOrder {
-            // --- Sequential Processing (Preserves Order) ---
-            var pageTexts: [String] = [] // Store text for each page
-            var pageErrors: [Error] = []
+            // --- Sequential Processing --- 
+            var pageTexts: [String] = []
+            var pageErrors: [Error] = [] // Collect errors encountered during page processing.
 
             for i in 0..<totalPages {
                 guard let page = pdfDocument.page(at: i) else {
-                    print("Warning: Could not get PDF page \(i + 1).")
-                    pageErrors.append(OCRError.pdfPageImageConversionFailed(page: i)) // Track error
-                    progressHandler?(i + 1, totalPages) // Report progress
+                    // This should ideally not happen if pageCount is correct.
+                    print("Warning: Could not retrieve PDF page \(i + 1).")
+                    let error = OCRError.pdfPageImageConversionFailed(page: i)
+                    pageErrors.append(error)
+                    progressHandler?(i + 1, totalPages)
                     continue
                 }
 
+                // Convert PDF page to an image (CGImage) for Vision processing.
+                // Using a scale factor based on 300 DPI for potentially better quality.
                 let pageSize = page.bounds(for: .cropBox)
-                let scaleFactor: CGFloat = 300.0 / 72.0
+                let scaleFactor: CGFloat = 300.0 / 72.0 
                 let imageSize = NSSize(width: pageSize.width * scaleFactor, height: pageSize.height * scaleFactor)
                 let thumbnail = page.thumbnail(of: imageSize, for: .cropBox)
 
                 guard let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
                     print("Warning: Could not convert PDF page \(i + 1) to image.")
-                    pageErrors.append(OCRError.pdfPageImageConversionFailed(page: i))
+                    let error = OCRError.pdfPageImageConversionFailed(page: i)
+                    pageErrors.append(error)
                     progressHandler?(i + 1, totalPages)
                     continue
                 }
 
-                // Perform OCR synchronously for the current page
+                // Perform OCR on the single page image.
                 let result = Self.performVisionRequest(cgImage: cgImage, recognitionLanguages: recognitionLanguages, recognitionLevel: recognitionLevel)
 
                 switch result {
                 case .success(let text):
                     pageTexts.append(text)
                 case .failure(let error):
+                    // Log the error but continue processing other pages.
                     print("Warning: OCR failed for PDF page \(i + 1): \(error.localizedDescription)")
                     pageErrors.append(error)
-                    pageTexts.append("") // Add empty string on error to maintain page count
+                    pageTexts.append("") // Append empty string to maintain page order correspondence.
                 }
-                progressHandler?(i + 1, totalPages) // Report progress after processing
+                progressHandler?(i + 1, totalPages)
             }
 
+            // Combine results and check for errors.
             let combinedText = pageTexts.joined(separator: "\n\n")
-
-            if combinedText.isEmpty && !pageErrors.isEmpty {
-                if let firstError = pageErrors.first as? OCRError { return .failure(firstError) }
-                else if let firstError = pageErrors.first { return .failure(.visionRequestFailed(firstError)) }
+            if let firstError = pageErrors.first {
+                // If any page failed, return the first error encountered.
+                if let ocrError = firstError as? OCRError {
+                    return .failure(ocrError)
+                } else {
+                    return .failure(.visionRequestFailed(firstError))
+                }
+            } else {
+                 // No errors encountered during page processing.
+                return .success(combinedText)
             }
-            return .success(combinedText)
 
         } else {
-            // --- Parallel Processing (Order Not Guaranteed) ---
-            var recognizedText = ""
-            var pageErrors: [Error] = []
+            // --- Parallel Processing --- 
+            var recognizedTexts = Array(repeating: "", count: totalPages) // Store results in order.
+            var pageErrors = Array<Error?>(repeating: nil, count: totalPages) // Store potential errors per page.
             var processedPages = 0
-            let lock = NSLock()
+            let lock = NSLock() // To safely update shared variables.
             let dispatchGroup = DispatchGroup()
 
             for i in 0..<totalPages {
                 dispatchGroup.enter()
-                guard let page = pdfDocument.page(at: i) else {
-                    print("Warning: Could not get PDF page \(i + 1).")
-                    let error = OCRError.pdfPageImageConversionFailed(page: i)
-                    lock.lock()
-                    pageErrors.append(error)
-                    processedPages += 1
-                    progressHandler?(processedPages, totalPages)
-                    lock.unlock()
-                    dispatchGroup.leave()
-                    continue
-                }
-
+                // Use a background queue for parallel execution.
                 DispatchQueue.global().async {
+                    defer { dispatchGroup.leave() } // Ensure leave is always called.
+
+                    guard let page = pdfDocument.page(at: i) else {
+                        print("Warning: Could not retrieve PDF page \(i + 1) in async task.")
+                        let error = OCRError.pdfPageImageConversionFailed(page: i)
+                        lock.lock()
+                        pageErrors[i] = error
+                        processedPages += 1
+                        progressHandler?(processedPages, totalPages)
+                        lock.unlock()
+                        return
+                    }
+
                     let pageSize = page.bounds(for: .cropBox)
                     let scaleFactor: CGFloat = 300.0 / 72.0
                     let imageSize = NSSize(width: pageSize.width * scaleFactor, height: pageSize.height * scaleFactor)
                     let thumbnail = page.thumbnail(of: imageSize, for: .cropBox)
 
                     guard let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-                        print("Warning: Could not convert PDF page \(i + 1) to image.")
+                        print("Warning: Could not convert PDF page \(i + 1) to image in async task.")
                         let error = OCRError.pdfPageImageConversionFailed(page: i)
                         lock.lock()
-                        pageErrors.append(error)
+                        pageErrors[i] = error
                         processedPages += 1
                         progressHandler?(processedPages, totalPages)
                         lock.unlock()
-                        dispatchGroup.leave()
                         return
                     }
 
@@ -180,212 +198,244 @@ public struct CoreOCRService {
                     switch result {
                     case .success(let text):
                         if !text.isEmpty {
-                            recognizedText += text + "\n\n"
+                             recognizedTexts[i] = text // Store text at the correct index.
                         }
                     case .failure(let error):
                         print("Warning: OCR failed for PDF page \(i + 1): \(error.localizedDescription)")
-                        pageErrors.append(error)
+                         pageErrors[i] = error // Store error at the correct index.
                     }
                     processedPages += 1
                     progressHandler?(processedPages, totalPages)
                     lock.unlock()
-
-                    dispatchGroup.leave()
                 }
             }
 
-            dispatchGroup.wait()
+            dispatchGroup.wait() // Wait for all async tasks to complete.
 
-            if recognizedText.hasSuffix("\n\n") {
-                recognizedText.removeLast(2)
-            }
-
-            if recognizedText.isEmpty && !pageErrors.isEmpty {
-                 if let firstError = pageErrors.first as? OCRError { return .failure(firstError) }
-                 else if let firstError = pageErrors.first { return .failure(.visionRequestFailed(firstError)) }
-            }
-            return .success(recognizedText)
+            // Check for errors after all pages are processed.
+            let firstError = pageErrors.compactMap { $0 }.first
+            if let error = firstError {
+                 if let ocrError = error as? OCRError {
+                     return .failure(ocrError)
+                 } else {
+                     return .failure(.visionRequestFailed(error))
+                 }
+             } else {
+                 // No errors, combine the texts in order.
+                 let combinedText = recognizedTexts.joined(separator: "\n\n")
+                 return .success(combinedText)
+             }
         }
     }
 
-    // Changed to static method
+    /// Performs the actual Vision text recognition request on a given `CGImage`.
+    /// This method is static as it doesn't depend on the service instance state.
     static private func performVisionRequest(cgImage: CGImage, recognitionLanguages: [String]?, recognitionLevel: VNRequestTextRecognitionLevel) -> Result<String, OCRError> {
         let requestHandler = VNImageRequestHandler(cgImage: cgImage, options: [:])
         var recognizedText = ""
         var recognitionError: OCRError? = nil
-        let semaphore = DispatchSemaphore(value: 0) // For synchronization
+        // Use a semaphore to wait for the asynchronous Vision request completion handler.
+        let semaphore = DispatchSemaphore(value: 0)
 
         let request = VNRecognizeTextRequest { (request, error) in
-            defer { semaphore.signal() } // Signal semaphore upon completion
+            defer { semaphore.signal() } // Signal completion.
 
             if let error = error {
+                // If the request itself failed.
                 recognitionError = .visionRequestFailed(error)
                 return
             }
-
             guard let observations = request.results as? [VNRecognizedTextObservation] else {
+                // If results are not the expected type.
                 recognitionError = .unexpectedResultType
                 return
             }
 
-            if !observations.isEmpty {
-                let pageText = observations.compactMap { observation in
-                    // Get the top candidate (most confident result)
-                    observation.topCandidates(1).first?.string
-                }.joined(separator: "\n")
-                recognizedText = pageText
+            // Extract text from observations.
+            let pageTextComponents = observations.compactMap { observation -> String? in
+                // Get the most confident recognition result.
+                observation.topCandidates(1).first?.string
             }
-            // Empty observations is not an error (just no text found)
+            recognizedText = pageTextComponents.joined(separator: "\n")
+            // Note: No text found (empty observations or candidates) is not treated as an error here.
         }
 
-        // Set options
-        if let languages = recognitionLanguages {
+        // Configure the Vision request.
+        if let languages = recognitionLanguages, !languages.isEmpty {
              request.recognitionLanguages = languages
         }
-        request.recognitionLevel = recognitionLevel // .accurate or .fast
+        request.recognitionLevel = recognitionLevel
+        // request.usesLanguageCorrection = false // Example: Optionally disable language correction.
 
         do {
-            // Perform the request
             try requestHandler.perform([request])
-             // Although perform can be synchronous, wait for the completion handler via semaphore
-             _ = semaphore.wait(timeout: .now() + 60) // Set a timeout (e.g., 60 seconds)
+             // Wait for the completion handler to signal (with a timeout).
+             _ = semaphore.wait(timeout: .now() + 60)
 
              if let error = recognitionError {
                   return .failure(error)
               } else {
-                  return .success(recognizedText) // Return recognized text
+                  return .success(recognizedText)
               }
         } catch {
-             // Handle errors during request performing
+            // Handle errors thrown by requestHandler.perform itself.
             return .failure(.visionRequestFailed(error))
         }
     }
 }
 
-// C ABIと互換性のあるエラーコード
+// MARK: - C Interface for Python ctypes
+
+/// Error codes for the C interface.
 @objc public enum CErrorCode: Int32 {
     case success = 0
     case errorFileNotFound = 1
     case errorImageLoadFailed = 2
     case errorPdfLoadFailed = 3
     case errorVisionRequestFailed = 4
-    case errorInvalidParameter = 5 // パラメータ不正を追加
-    case errorOther = 6          // 他のエラーコードを調整
+    case errorInvalidParameter = 5
+    case errorMemoryAllocation = 6 // Specific error for memory issues
+    case errorOther = 7
 }
 
-// C ABIと互換性のある認識レベル
+/// Recognition level options for the C interface.
 @objc public enum CRecognitionLevel: Int32 {
     case accurate = 0
     case fast = 1
 }
 
-// SwiftのStringを解放するための関数
+/// Frees the memory allocated for a C string returned by the Swift library.
+/// This function MUST be called from the calling C code (e.g., Python ctypes)
+/// to prevent memory leaks when receiving strings from `recognize_text_c`.
+/// - Parameter ptr: A pointer to the C string (char*) previously returned
+///                  via `outputResult` or `outputError`.
 @_cdecl("free_swift_string")
 public func free_swift_string(ptr: UnsafeMutablePointer<CChar>?) {
-    // freeを使用（strdupで確保したメモリを解放するため）
+    // Assumes the string was allocated using strdup, which uses malloc.
     free(ptr)
 }
 
-// メインのCインターフェース関数 (パラメータ追加)
+/// C-compatible function to recognize text from a file.
+///
+/// This function serves as the bridge between Swift and C-based languages like Python (via ctypes).
+/// It handles the conversion of C types to Swift types, calls the Swift OCR service,
+/// converts the results (or errors) back to C types, and manages memory allocation
+/// for the returned strings.
+///
+/// - Parameter filePath: A C string (UTF-8 encoded) representing the path to the image or PDF file.
+/// - Parameter languages: A pointer to an array of C strings (char**), each representing a language code (e.g., "en-US").
+///                      Pass `nil` or an empty array (with `languageCount = 0`) for automatic language detection.
+/// - Parameter languageCount: The number of elements in the `languages` array.
+/// - Parameter level: The desired recognition level (0 for `.accurate`, 1 for `.fast`).
+/// - Parameter preserveOrder: Flag to preserve page order in PDFs (0 for `false`, non-zero for `true`).
+/// - Parameter outputResult: A pointer to a C string pointer (`char**`). On success, this will be set to point
+///                         to a newly allocated C string containing the recognized text. The caller
+///                         is responsible for freeing this string using `free_swift_string`.
+/// - Parameter outputError: A pointer to a C string pointer (`char**`). On failure, this will be set to point
+///                        to a newly allocated C string containing the error description. The caller
+///                        is responsible for freeing this string using `free_swift_string`.
+/// - Returns: A `CErrorCode` indicating success (0) or the type of error that occurred.
 @_cdecl("recognize_text_c")
 public func recognize_text_c(
     filePath: UnsafePointer<CChar>,
-    languages: UnsafePointer<UnsafePointer<CChar>?>?, // 言語文字列ポインタの配列 (NULL許容)
-    languageCount: Int32,                           // 言語配列の要素数
-    level: Int32,                                   // CRecognitionLevel の rawValue
-    preserveOrder: Int32,                           // 0: false, 1: true
-    outputResult: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>, // 結果文字列へのポインタのポインタ
-    outputError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>   // エラー文字列へのポインタのポインタ
+    languages: UnsafePointer<UnsafePointer<CChar>?>?,
+    languageCount: Int32,
+    level: Int32,
+    preserveOrder: Int32,
+    outputResult: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>, 
+    outputError: UnsafeMutablePointer<UnsafeMutablePointer<CChar>?>
 ) -> CErrorCode {
-    outputResult.pointee = nil // Initialize output pointers
+
+    // Initialize output pointers to nil.
+    outputResult.pointee = nil
     outputError.pointee = nil
 
-    // --- パラメータ変換 ---
+    // --- Convert C parameters to Swift types ---
     let path = String(cString: filePath)
 
-    // 言語リストの変換 (nil または 有効な配列)
     var swiftLanguages: [String]? = nil
     if let langPtr = languages, languageCount > 0 {
         swiftLanguages = []
         for i in 0..<Int(languageCount) {
-            if let langCStringPtr = langPtr[i] {
-                swiftLanguages?.append(String(cString: langCStringPtr))
-            } else {
-                 // 配列内にNULLポインタがあった場合のエラー処理 (例)
+            guard let langCStringPtr = langPtr[i] else {
                 let errorMsg = "Invalid language array: contains NULL pointer."
                 outputError.pointee = strdup(errorMsg)
-                return .errorInvalidParameter
+                // Check allocation success before returning
+                return outputError.pointee == nil ? .errorMemoryAllocation : .errorInvalidParameter
             }
+            swiftLanguages?.append(String(cString: langCStringPtr))
         }
     } else if languages != nil && languageCount <= 0 {
-         // ポインタは非NULLだが要素数が0以下の場合もエラーとする (任意)
         let errorMsg = "Invalid language parameter: non-nil array with count <= 0."
         outputError.pointee = strdup(errorMsg)
-        return .errorInvalidParameter
+        return outputError.pointee == nil ? .errorMemoryAllocation : .errorInvalidParameter
     }
-    // languages が NULL かつ languageCount が 0 の場合は swiftLanguages = nil のまま (自動検出)
 
-    // 認識レベルの変換
-    guard let swiftRecognitionLevel = VNRequestTextRecognitionLevel(cRecognitionLevel: CRecognitionLevel(rawValue: level)) else {
-        let errorMsg = "Invalid recognition level value: \\(level)"
+    guard let cRecoLevel = CRecognitionLevel(rawValue: level), 
+          let swiftRecognitionLevel = VNRequestTextRecognitionLevel(cRecognitionLevel: cRecoLevel) else {
+        let errorMsg = "Invalid recognition level value: \(level)"
         outputError.pointee = strdup(errorMsg)
-        return .errorInvalidParameter
+        return outputError.pointee == nil ? .errorMemoryAllocation : .errorInvalidParameter
     }
 
-    // ページ順序維持フラグの変換
-    let swiftPreserveOrder = (preserveOrder != 0) // 0以外ならtrue
+    let swiftPreserveOrder = (preserveOrder != 0)
 
-    // --- CoreOCRServiceの呼び出し ---
+    // --- Call Swift OCR Service ---
     let service = CoreOCRService()
     let result = service.recognizeText(
         from: path,
         recognitionLanguages: swiftLanguages,
         recognitionLevel: swiftRecognitionLevel,
         preservePageOrder: swiftPreserveOrder
-        // progressHandler はCインターフェースでは未対応 (必要なら拡張が必要)
+        // progressHandler is not exposed via C interface currently.
     )
 
-    // --- 結果/エラーのC文字列への変換 ---
+    // --- Convert Swift Result/Error back to C types ---
     switch result {
     case .success(let recognizedText):
         guard let cStringResult = strdup(recognizedText) else {
+            // Handle memory allocation failure for the result string.
             let errorMsg = "Memory allocation failed for result string."
-            outputError.pointee = strdup(errorMsg)
-            return .errorOther
+            outputError.pointee = strdup(errorMsg) // Try to report allocation error
+             return .errorMemoryAllocation
         }
         outputResult.pointee = cStringResult
         return .success
+
     case .failure(let error):
         let errorMessage = error.localizedDescription
         guard let cStringError = strdup(errorMessage) else {
-            return .errorOther // メモリ確保失敗
+            // Memory allocation failed even for the error message.
+            return .errorMemoryAllocation
         }
         outputError.pointee = cStringError
 
+        // Map Swift OCRError to CErrorCode for more specific error reporting.
         if let ocrError = error as? OCRError {
             switch ocrError {
             case .fileNotFound: return .errorFileNotFound
             case .imageLoadFailed: return .errorImageLoadFailed
             case .pdfLoadFailed: return .errorPdfLoadFailed
             case .visionRequestFailed: return .errorVisionRequestFailed
-            // imageConversionFailed, unexpectedResultType, pdfPageImageConversionFailed も .errorOther にマッピング
-            default: return .errorOther
+            case .imageConversionFailed, .unexpectedResultType, .pdfPageImageConversionFailed:
+                 return .errorOther // Map less specific errors to .errorOther
             }
         } else {
+            // Non-OCRError types are mapped to .errorOther
             return .errorOther
         }
     }
 }
 
-// VNRequestTextRecognitionLevel と CRecognitionLevel を相互変換するためのヘルパー
-// (VNRequestTextRecognitionLevel の extension として定義すると便利)
+// MARK: - Helpers
+
+/// Extension to initialize VNRequestTextRecognitionLevel from the C enum.
 extension VNRequestTextRecognitionLevel {
     init?(cRecognitionLevel: CRecognitionLevel?) {
         guard let level = cRecognitionLevel else { return nil }
         switch level {
         case .accurate: self = .accurate
         case .fast: self = .fast
-        // default は不要、enumが網羅的なため
         }
     }
 } 
